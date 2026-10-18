@@ -17,9 +17,59 @@ export async function getBogotaDateFromServer(): Promise<string> {
   return formatter.format(new Date()); // Retorna YYYY-MM-DD
 }
 
+// Cache local de supervisores para evitar peticiones redundantes
+let cachedSupervisors: { id: string; email: string }[] | null = null;
+
+// Obtener una lista de supervisores para los filtros de historial y resolución de uploader
+export async function getSupervisors(): Promise<{ id: string; email: string }[]> {
+  if (cachedSupervisors && cachedSupervisors.length > 0) {
+    return cachedSupervisors;
+  }
+
+  // 1. Intentar vista supervisor_emails
+  try {
+    const { data, error } = await supabase
+      .from('supervisor_emails')
+      .select('*')
+      .order('email', { ascending: true });
+
+    if (!error && data && data.length > 0) {
+      cachedSupervisors = data;
+      return data;
+    }
+  } catch (e) {
+    console.warn('Consulta a supervisor_emails no disponible, intentando RPC:', e);
+  }
+
+  // 2. Fallback a función RPC con SECURITY DEFINER si está configurada
+  try {
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('get_supervisor_emails');
+    if (!rpcErr && rpcData && Array.isArray(rpcData) && rpcData.length > 0) {
+      cachedSupervisors = rpcData;
+      return rpcData;
+    }
+  } catch {}
+
+  // 3. Fallback a la sesión autenticada activa
+  try {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.user?.id && session?.user?.email) {
+      return [{ id: session.user.id, email: session.user.email }];
+    }
+  } catch {}
+
+  return [];
+}
+
 // 2. Obtener el estado diario de todos los lectores
 export async function getDailyStatus(dateStr: string): Promise<ReaderDailyStatus[]> {
-  const readers = await getReaders();
+  const [readers, supervisors] = await Promise.all([
+    getReaders(),
+    getSupervisors()
+  ]);
+
+  const supervisorMap = new Map<string, string>();
+  supervisors.forEach(s => supervisorMap.set(s.id, s.email));
   
   // Consultar reportes diarios (itinerarios)
   const { data: reports, error: reportsError } = await supabase
@@ -31,10 +81,10 @@ export async function getDailyStatus(dateStr: string): Promise<ReaderDailyStatus
     console.error('Error al obtener itinerarios diarios:', reportsError);
   }
 
-  // Consultar registros de fotos (con supervisor y apoyado si existe)
+  // Consultar registros de fotos (con supported_reader desacoplado de la vista de usuarios)
   const { data: records, error } = await supabase
     .from('photo_records')
-    .select('*, supervisor:supervisor_emails(email), supported_reader:readers!supported_reader_id(id, name)')
+    .select('*, supported_reader:readers!supported_reader_id(id, name)')
     .eq('capture_date', dateStr);
 
   if (error) {
@@ -57,15 +107,15 @@ export async function getDailyStatus(dateStr: string): Promise<ReaderDailyStatus
     // Mapear campos extendidos
     if (entradaRecord) {
       entradaRecord.reader = reader;
-      entradaRecord.uploader_email = entradaRecord.supervisor?.email;
+      entradaRecord.uploader_email = supervisorMap.get(entradaRecord.uploaded_by) || entradaRecord.uploader_email || 'Supervisor';
     }
     if (salidaRecord) {
       salidaRecord.reader = reader;
-      salidaRecord.uploader_email = salidaRecord.supervisor?.email;
+      salidaRecord.uploader_email = supervisorMap.get(salidaRecord.uploaded_by) || salidaRecord.uploader_email || 'Supervisor';
     }
     apoyoRecords.forEach((apoyo) => {
       apoyo.reader = reader;
-      apoyo.uploader_email = apoyo.supervisor?.email;
+      apoyo.uploader_email = supervisorMap.get(apoyo.uploaded_by) || apoyo.uploader_email || 'Supervisor';
       apoyo.supported_reader = apoyo.supported_reader ? {
         id: apoyo.supported_reader.id,
         name: apoyo.supported_reader.name,
@@ -216,7 +266,14 @@ export async function getMonthlyMatrixData(monthYear: string): Promise<{
   records: PhotoRecord[];
   readers: Reader[];
 }> {
-  const readers = await getReaders();
+  const [readers, supervisors] = await Promise.all([
+    getReaders(),
+    getSupervisors()
+  ]);
+
+  const supervisorMap = new Map<string, string>();
+  supervisors.forEach(s => supervisorMap.set(s.id, s.email));
+
   const startDate = `${monthYear}-01`;
   const [year, month] = monthYear.split('-').map(Number);
   const lastDay = new Date(year, month, 0).getDate();
@@ -224,7 +281,7 @@ export async function getMonthlyMatrixData(monthYear: string): Promise<{
 
   const { data: records, error } = await supabase
     .from('photo_records')
-    .select('*, supervisor:supervisor_emails(email), supported_reader:readers!supported_reader_id(id, name)')
+    .select('*, supported_reader:readers!supported_reader_id(id, name)')
     .gte('capture_date', startDate)
     .lte('capture_date', endDate);
 
@@ -236,7 +293,7 @@ export async function getMonthlyMatrixData(monthYear: string): Promise<{
   const formattedRecords = (records || []).map((r) => ({
     ...r,
     reader: readers.find((rd) => rd.id === r.reader_id),
-    uploader_email: r.supervisor?.email,
+    uploader_email: supervisorMap.get(r.uploaded_by) || 'Supervisor',
     supported_reader: r.supported_reader ? {
       id: r.supported_reader.id,
       name: r.supported_reader.name,
@@ -257,13 +314,13 @@ export async function getHistory(filters: {
   photoType?: string;
   uploaderId?: string;
 }): Promise<PhotoRecord[]> {
-  console.log("[HISTORY] START");
-  console.log("[HISTORY] FILTERS", filters);
-  console.log("[HISTORY] QUERY START");
+  const supervisors = await getSupervisors();
+  const supervisorMap = new Map<string, string>();
+  supervisors.forEach(s => supervisorMap.set(s.id, s.email));
 
   let query = supabase
     .from('photo_records')
-    .select('*, reader:readers!reader_id(*), supervisor:supervisor_emails(email), supported_reader:readers!supported_reader_id(id, name)')
+    .select('*, reader:readers!reader_id(*), supported_reader:readers!supported_reader_id(id, name)')
     .order('created_at', { ascending: false });
 
   if (filters.readerId) {
@@ -287,16 +344,12 @@ export async function getHistory(filters: {
       details: error.details,
       hint: error.hint
     });
-    console.log("[HISTORY] QUERY FINISHED");
     throw new Error('No se pudo obtener el historial de fotografías.');
   }
 
-  console.log("[HISTORY] DATA", records);
-  console.log("[HISTORY] QUERY FINISHED");
-
   const formattedRecords = (records || []).map((r) => ({
     ...r,
-    uploader_email: r.supervisor?.email,
+    uploader_email: supervisorMap.get(r.uploaded_by) || 'Supervisor',
     supported_reader: r.supported_reader ? {
       id: r.supported_reader.id,
       name: r.supported_reader.name,
@@ -321,17 +374,10 @@ export async function getHistory(filters: {
 
     if (!reportsError && reports) {
       formattedRecords.forEach((rec) => {
-        // Encontrar reporte para el lector y fecha del registro
         const rep = reports.find(
           (r) => r.reader_id === rec.reader_id && r.report_date === rec.capture_date
         );
-        // Colocamos el itinerario en el record
-        if (rep) {
-          // Asociaremos el itinerario en una propiedad extendida para la UI
-          (rec as any).itinerary = rep.itinerary;
-        } else {
-          (rec as any).itinerary = null;
-        }
+        (rec as any).itinerary = rep ? rep.itinerary : null;
       });
     }
   } catch (repErr) {
@@ -353,18 +399,4 @@ export async function getSignedUrl(storagePath: string): Promise<string> {
   }
 
   return data.signedUrl;
-}
-
-// 8. Obtener una lista de supervisores para los filtros de historial
-export async function getSupervisors(): Promise<{ id: string; email: string }[]> {
-  const { data, error } = await supabase
-    .from('supervisor_emails')
-    .select('*')
-    .order('email', { ascending: true });
-
-  if (error) {
-    console.error('Error al obtener supervisores:', error);
-    return [];
-  }
-  return data || [];
 }
